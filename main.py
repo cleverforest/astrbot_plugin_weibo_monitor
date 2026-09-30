@@ -1457,9 +1457,7 @@ class WeiboMonitor(Star):
         时间无法解析时采用宽松策略，避免因微博接口时间格式变化而误删新消息。
         """
         try:
-            max_age_minutes = int(
-                self._get_config("max_post_age_minutes", 0) or 0
-            )
+            max_age_minutes = int(self._get_config("max_post_age_minutes", 0) or 0)
         except (TypeError, ValueError):
             return False
         if max_age_minutes <= 0:
@@ -1479,9 +1477,7 @@ class WeiboMonitor(Star):
                     stored_time = legacy_time.group(1)
             published_at = datetime.fromisoformat(stored_time)
             if published_at.tzinfo is None:
-                published_at = published_at.replace(
-                    tzinfo=timezone(timedelta(hours=8))
-                )
+                published_at = published_at.replace(tzinfo=timezone(timedelta(hours=8)))
         except (TypeError, ValueError):
             self.plugin_logger.warning(
                 f"WeiboMonitor: 微博 {post_id} 的发布时间无法解析，未应用时效过滤: {created_at}"
@@ -4290,7 +4286,7 @@ class WeiboMonitor(Star):
         """
         检查指定UID的最新微博。
         :param uid: 微博用户ID
-        :param force_fetch: 是否强制获取最新一条（不比较last_id）
+        :param force_fetch: 是否手动获取最新一条（不比较last_id、不应用时效过滤）
         :return: 包含新微博信息的列表
         """
         try:
@@ -4471,7 +4467,10 @@ class WeiboMonitor(Star):
 
             created_at_raw = mblog.get("created_at")
             created_at = self._parse_weibo_time(created_at_raw)
-            if self._should_skip_by_post_age(created_at, current_id):
+            # 手动检查只绕过时效限制，仍保留关键词及原创/转发过滤。
+            if not force_fetch and self._should_skip_by_post_age(
+                created_at, current_id
+            ):
                 continue
             image_urls = self._extract_image_urls(mblog, text_html)
             video_info = self._extract_video_info(mblog)

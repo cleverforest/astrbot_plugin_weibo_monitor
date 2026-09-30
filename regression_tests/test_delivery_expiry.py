@@ -8,6 +8,7 @@ import ast
 import asyncio
 import copy
 import logging
+import random
 import re
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -29,25 +30,76 @@ class MessageChain:
 
 
 def load_monitor():
-    tree = ast.parse(Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8"))
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "WeiboMonitor")
+    tree = ast.parse(
+        Path(__file__)
+        .resolve()
+        .parents[1]
+        .joinpath("main.py")
+        .read_text(encoding="utf-8")
+    )
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "WeiboMonitor"
+    )
     methods = {
-        "_get_config", "_parse_weibo_time", "_should_skip_by_post_age",
-        "_persist_discovered_posts", "_queue_pending_delivery",
-        "_enqueue_pending_deliveries", "_discard_expired_deliveries",
-        "_push_consumer", "_send_post_to_targets", "_collect_new_posts",
-        "_resolve_mblog_text_html", "_extract_image_urls",
-        "_extract_inline_image_urls", "_normalize_inline_image_url",
+        "_get_config",
+        "_parse_weibo_time",
+        "_should_skip_by_post_age",
+        "_persist_discovered_posts",
+        "_queue_pending_delivery",
+        "_enqueue_pending_deliveries",
+        "_discard_expired_deliveries",
+        "_push_consumer",
+        "_send_post_to_targets",
+        "_collect_new_posts",
+        "_resolve_mblog_text_html",
+        "_extract_image_urls",
+        "_extract_inline_image_urls",
+        "_normalize_inline_image_url",
+        "weibo_check",
+        "weibo_check_all",
+        "check_weibo",
+        "_send_new_posts",
+        "_has_filter_keyword",
+        "_should_skip_by_whitelist",
     }
     cls.bases = []
     cls.decorator_list = []
     cls.body = [node for node in cls.body if getattr(node, "name", "") in methods]
+    for method in cls.body:
+        if method.name in {"weibo_check", "weibo_check_all"}:
+            method.decorator_list = []
     constants = [node for node in tree.body if isinstance(node, ast.Assign)]
-    module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *constants, cls], type_ignores=[])
-    namespace = dict(globals(), Comp=SimpleNamespace(
-        Image=lambda **kw: ("image", kw),
-        Video=SimpleNamespace(fromFileSystem=lambda **kw: ("video", kw)),
-    ))
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            *constants,
+            cls,
+        ],
+        type_ignores=[],
+    )
+    # 显式列出动态执行的方法依赖，避免 Ruff 将必要导入当作未使用删除。
+    namespace = {
+        "asyncio": asyncio,
+        "copy": copy,
+        "random": random,
+        "re": re,
+        "datetime": datetime,
+        "timedelta": timedelta,
+        "timezone": timezone,
+        "parse_qs": parse_qs,
+        "quote": quote,
+        "urlparse": urlparse,
+        "BeautifulSoup": BeautifulSoup,
+        "MessageChain": MessageChain,
+        "Comp": SimpleNamespace(
+            Image=lambda **kw: ("image", kw),
+            Video=SimpleNamespace(fromFileSystem=lambda **kw: ("video", kw)),
+        ),
+    }
     exec(compile(ast.fix_missing_locations(module), "main.py", "exec"), namespace)
     return namespace["WeiboMonitor"]
 
@@ -83,12 +135,21 @@ class DeliveryExpiryTests(unittest.IsolatedAsyncioTestCase):
 
     def add_post(self, minutes=5, post_id="100", targets=None):
         post = {
-            "_post_id": post_id, "text": "test", "username": "tester",
-            "created_at": (self.now - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S"),
-            "image_urls": [], "video_info": None,
+            "_post_id": post_id,
+            "text": "test",
+            "username": "tester",
+            "created_at": (self.now - timedelta(minutes=minutes)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "image_urls": [],
+            "video_info": None,
         }
         delivery_id = self.monitor._persist_discovered_posts(
-            "1", [post], targets or ["group1"], "{weibo}", None,
+            "1",
+            [post],
+            targets or ["group1"],
+            "{weibo}",
+            None,
         )[0]
         return delivery_id
 
@@ -107,7 +168,9 @@ class DeliveryExpiryTests(unittest.IsolatedAsyncioTestCase):
     def test_restart_removes_expired_even_with_future_retry(self):
         old = self.add_post(60, "100")
         fresh = self.add_post(5, "101")
-        self.monitor._data["_pending_deliveries"][old]["next_retry_at"] = "2026-09-12 12:00:00"
+        self.monitor._data["_pending_deliveries"][old]["next_retry_at"] = (
+            "2026-09-12 12:00:00"
+        )
         self.monitor._enqueue_pending_deliveries()
         self.assertNotIn(old, self.saved["_pending_deliveries"])
         self.assertEqual(self.saved["last_id_1"], "999")
@@ -115,7 +178,7 @@ class DeliveryExpiryTests(unittest.IsolatedAsyncioTestCase):
         self.monitor._log_to_daily_file.assert_not_called()
 
     async def test_post_expires_while_queued(self):
-        delivery_id = self.add_post(29)
+        self.add_post(29)
         self.monitor._enqueue_pending_deliveries()
         self.now += timedelta(minutes=2)
         await self.consume()
@@ -162,11 +225,15 @@ class DeliveryExpiryTests(unittest.IsolatedAsyncioTestCase):
         await self.consume()
         self.monitor._send_message_with_timeout.assert_awaited_once()
         self.assertEqual(self.saved["_pending_deliveries"], {})
-        self.assertEqual(self.monitor._log_to_daily_file.call_args.kwargs["delivery_count"], 1)
+        self.assertEqual(
+            self.monitor._log_to_daily_file.call_args.kwargs["delivery_count"], 1
+        )
 
     async def test_expiry_during_video_download(self):
         delivery_id = self.add_post(29)
-        self.monitor._data["_pending_deliveries"][delivery_id]["post"]["video_info"] = {"url": "video"}
+        self.monitor._data["_pending_deliveries"][delivery_id]["post"]["video_info"] = {
+            "url": "video"
+        }
 
         async def download(post):
             self.now += timedelta(minutes=2)
@@ -208,7 +275,9 @@ class DeliveryExpiryTests(unittest.IsolatedAsyncioTestCase):
                     self.setUp()
                     m = self.monitor
                     delivery_id = self.add_post(120)
-                    m._data["_pending_deliveries"][delivery_id]["post"]["created_at"] = raw
+                    m._data["_pending_deliveries"][delivery_id]["post"][
+                        "created_at"
+                    ] = raw
                     if already_queued:
                         m._queue_pending_delivery(delivery_id)
                     else:
@@ -230,9 +299,9 @@ class DeliveryExpiryTests(unittest.IsolatedAsyncioTestCase):
         self.monitor._send_message_with_timeout.assert_awaited_once()
 
     def test_invalid_legacy_timestamp_is_still_reported(self):
-        self.assertFalse(self.monitor._should_skip_by_post_age(
-            "2026-99-99 10:00:00 00:00:00", 100
-        ))
+        self.assertFalse(
+            self.monitor._should_skip_by_post_age("2026-99-99 10:00:00 00:00:00", 100)
+        )
         self.monitor.plugin_logger.warning.assert_called_once()
 
     async def test_cleanup_failure_during_send_preserves_delivery_confirmation(self):
@@ -275,8 +344,14 @@ class DeliveryExpiryTests(unittest.IsolatedAsyncioTestCase):
                 m._send_message_with_timeout.side_effect = None
                 m._enqueue_pending_deliveries()
                 await self.consume()
-                sent_targets = [call.args[0] for call in m._send_message_with_timeout.await_args_list]
-                self.assertEqual(sent_targets, ["group1", "group2"] + (["group2"] if partial_failure else []))
+                sent_targets = [
+                    call.args[0]
+                    for call in m._send_message_with_timeout.await_args_list
+                ]
+                self.assertEqual(
+                    sent_targets,
+                    ["group1", "group2"] + (["group2"] if partial_failure else []),
+                )
                 self.assertEqual(self.saved["_pending_deliveries"], {})
                 m._log_to_daily_file.assert_called_once()
 
@@ -290,13 +365,96 @@ class DeliveryExpiryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.saved["_pending_deliveries"], {})
 
     def test_time_formats_and_boundary(self):
-        for raw in ["2026-09-11 11:30:00", "2026-09-11T03:30:00Z", "Fri Sep 11 03:30:00 +0000 2026"]:
+        for raw in [
+            "2026-09-11 11:30:00",
+            "2026-09-11T03:30:00Z",
+            "Fri Sep 11 03:30:00 +0000 2026",
+        ]:
             with self.subTest(raw=raw):
                 parsed = self.monitor._parse_weibo_time(raw)
                 self.assertEqual(parsed, "2026-09-11 11:30:00")
                 self.assertFalse(self.monitor._should_skip_by_post_age(parsed, 100))
-        self.assertTrue(self.monitor._should_skip_by_post_age("2026-09-11 11:29:59", 100))
+        self.assertTrue(
+            self.monitor._should_skip_by_post_age("2026-09-11 11:29:59", 100)
+        )
         self.assertFalse(self.monitor._should_skip_by_post_age("unknown", 100))
+
+    def prepare_manual_check(self, posts):
+        m = self.monitor
+        m.config["account_settings"] = {"weibo_urls": ["1"]}
+        m._parse_urls = lambda urls: urls
+        m._get_cookie_value = lambda: "test-cookie"
+        m.cookie_health_status = "valid"
+        m.parse_uid = AsyncMock(return_value="1")
+        m._fetch_weibo_cards = AsyncMock(return_value=[{"card_type": 9}])
+        m._extract_valid_mblogs = lambda cards: (posts, "tester")
+        m.get_kv_data = AsyncMock(return_value="999")
+        m.put_kv_data = AsyncMock()
+        m.session_initialized_uids = set()
+        m._get_all_subscribed_sessions = lambda: ["group1"]
+        m._get_targets_for_uid = lambda uid: ["group1"]
+        m._format_manual_delivery_message = Mock(return_value="sent")
+        m._resolve_mblog_text_html = AsyncMock(
+            side_effect=lambda post, uid: post["text"]
+        )
+        m.clean_text = lambda html: html
+        m._extract_video_info = lambda post: None
+        return SimpleNamespace(
+            unified_msg_origin="current-session", plain_result=lambda text: text
+        )
+
+    def old_manual_post(self, post_id="102", text="allowed"):
+        return {
+            "id": post_id,
+            "bid": post_id,
+            "text": text,
+            "created_at": (self.now - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    async def test_manual_commands_send_expired_posts_without_advancing_cursor(self):
+        for command in ("weibo_check", "weibo_check_all"):
+            with self.subTest(command=command):
+                self.setUp()
+                event = self.prepare_manual_check([self.old_manual_post()])
+                m = self.monitor
+                results = [result async for result in getattr(m, command)(event)]
+                self.assertEqual(results[-1], "sent")
+                m._send_message_with_timeout.assert_awaited_once()
+                target, chain = m._send_message_with_timeout.await_args.args
+                self.assertEqual(target, "group1")
+                self.assertEqual(chain.chain, ["allowed"])
+                m.put_kv_data.assert_not_awaited()
+                self.assertEqual(m._data["last_id_1"], "999")
+                self.assertEqual(m._data["_pending_deliveries"], {})
+                m._log_to_daily_file.assert_not_called()
+
+    async def test_manual_commands_still_apply_content_filters(self):
+        for command in ("weibo_check", "weibo_check_all"):
+            for mode in ("blacklist", "whitelist", "original", "forward"):
+                with self.subTest(command=command, mode=mode):
+                    self.setUp()
+                    rejected = self.old_manual_post("103", "blocked")
+                    accepted = self.old_manual_post("102", "allowed")
+                    m = self.monitor
+                    if mode == "blacklist":
+                        m.config["filter_settings"]["filter_keywords"] = ["blocked"]
+                    elif mode == "whitelist":
+                        m.config["filter_settings"]["whitelist_keywords"] = ["allowed"]
+                    elif mode == "original":
+                        m.config["content_settings"] = {"send_original": False}
+                        accepted["retweeted_status"] = {}
+                    else:
+                        m.config["content_settings"] = {"send_forward": False}
+                        rejected["retweeted_status"] = {}
+                    event = self.prepare_manual_check([rejected, accepted])
+                    results = [result async for result in getattr(m, command)(event)]
+                    self.assertEqual(results[-1], "sent")
+                    m._send_message_with_timeout.assert_awaited_once()
+                    self.assertEqual(
+                        m._send_message_with_timeout.await_args.args[1].chain,
+                        ["allowed"],
+                    )
+                    m.put_kv_data.assert_not_awaited()
 
     async def test_new_post_filter_accepts_normalized_dates(self):
         m = self.monitor
@@ -327,20 +485,32 @@ class DeliveryExpiryTests(unittest.IsolatedAsyncioTestCase):
                     json=lambda: {"ok": 1, "data": {"longTextContent": full_html}},
                 )
                 m.client = SimpleNamespace(get=AsyncMock(return_value=response))
-                m.clean_text = lambda html: BeautifulSoup(html, "html.parser").get_text()
+                m.clean_text = lambda html: BeautifulSoup(
+                    html, "html.parser"
+                ).get_text()
                 m._has_filter_keyword = lambda *args: False
                 m._should_skip_by_whitelist = lambda *args: False
                 m._extract_video_info = lambda post: None
                 post = {
-                    "id": "102", "bid": "fresh", "text": "摘要", "pics": [],
-                    "isLongText": True, "created_at": "2026-09-11 11:59:00",
+                    "id": "102",
+                    "bid": "fresh",
+                    "text": "摘要",
+                    "pics": [],
+                    "isLongText": True,
+                    "created_at": "2026-09-11 11:59:00",
                 }
 
-                collected = await m._collect_new_posts("1", [post], 100, False, "tester")
+                collected = await m._collect_new_posts(
+                    "1", [post], 100, False, "tester"
+                )
 
                 self.assertEqual(len(collected), 1)
-                self.assertEqual(collected[0]["text"], "完整正文 查看图片" if enabled else "摘要")
-                self.assertEqual(collected[0]["image_urls"], [image_url] if enabled else [])
+                self.assertEqual(
+                    collected[0]["text"], "完整正文 查看图片" if enabled else "摘要"
+                )
+                self.assertEqual(
+                    collected[0]["image_urls"], [image_url] if enabled else []
+                )
                 if enabled:
                     m.client.get.assert_awaited_once()
                 else:
